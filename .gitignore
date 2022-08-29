@@ -1,0 +1,12 @@
+# kicad
+*backups/
+fp-info-cache
+fp-lib-table
+_autosave*
+*.zip
+
+*sw[op]
+*-bak
+*~
+
+.DS_Store
