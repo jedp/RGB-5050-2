@@ -17,64 +17,94 @@ These high-speed LEDs deal in ones and zeros at microsecond speed. One way to ge
 kind of speed out of an STM32 without tying up the CPU and/or writing a lot of custom
 assembly is to use SPI to transmit the data, possibly using DMA to send the data to SPI.
 
-For example, this function packs 24-bit RGB data into a buffer that can be sent over
-SPI at 5Mbps on an STM32F042:
+The RGB5050 encodes 0 and 1 values as high/low transitions like so:
 
 ```
+0 -> 0.3µs high ± 0.15µs, 0.9µs low ± 0.15µs
+1 -> 0.6µs high ± 0.15µs, 0.6µs low ± 0.15µs
+```
+
+My first attempt was to try a transfer rate of 2.5Mbps, since this would
+require the minimum number of encoded output bits (0 -> 0b100, 1 -> 0b110).
+This is obviously out of spec for the timings. It was worth a go, bit it didn't
+work reliably.
+
+Bumping the transfer rate to 5Mbps doubles the number of bits required, but
+has the benefit of actually working:
+
+```
+0 -> 0b100000 (0.2µs high, 1.0µs low)
+1 -> 0b111000 (0.6µs high, 0.6µs low)
+```
+
+To implement this, one could iterate over each source byte of and do some fancy
+bit arithmetic for every single byte (see previous commit), or one could follow
+the advice of the mighty Ross Glashan and just use a lookup table, since there
+are only 16 possible encodings of each nibble.
+
+For example:
+
+```
+static uint32_t color_nibbles[16] = {
+		0x820820, // 0b0000 -> 0b100000100000100000100000
+		0x820838, // 0b0001 -> 0b100000100000100000111000
+		0x820e20, // 0b0010 -> 0b100000100000111000100000
+		0x820e38, // etc.
+		0x838820,
+		0x838838,
+		0x838e20,
+		0x838e38,
+		0xe20820,
+		0xe20838,
+		0xe20e20,
+		0xe20e38,
+		0xe38820,
+		0xe38838,
+		0xe38e20,
+		0xe38e38, // 0b1111 -> 0b111000111000111000111000
+};
+
 /*
- * Rather non-portable. Packs RGB5050 data into strings of six bits
- * intended for sending over SPI at 5Mbps. That should nevertheless
- * be easy to configure on almost any STM32.
- *
- * (I tried a transfer rate of 2.5Mbps and three bits per zero or one,
- * but that falls just outside of the published tolerances and indeed
- * it did not work reliably. Hency my use of 6 bits at 5Mbps.)
- *
- * With a SPI transfer rate of 5Mbps, we can encode 0 and 1 as follows:
- *
- * 0 -> 0b100000 (0.2µs high, 1.0µs low)
- * 1 -> 0b111000 (0.6µs high, 0.6µs low)
- *
- * This is within the tolerance of the specification:
- *
- * 0 -> 0.3µs high ± 0.15µs, 0.9µs low ± 0.15µs
- * 1 -> 0.6µs high ± 0.15µs, 0.6µs low ± 0.15µs
+ * Convert the pixel represented by (r, g, b), using the scheme described
+ * at the head of this file, and pack it into buf in RGB 5050 order:
+ * G, R, B; MSB first.
  */
-void RGB5050_color_write(int r, int g, int b, uint8_t *buf) {
-  // For the sake of having normal function parameters, the bits end
-  // up packed backwards here. We will reverse them in the loop below.
-  int rgb_data = ((g & 0xff) << 16) | ((r & 0xff) << 8) | (b & 0xff);
+void RGB5050_pixel_write(uint8_t r, uint8_t g, uint8_t b, uint8_t *buf) {
+	// For each nibble of r, g, b, get the 24-bit output encoding of that nibble.
+	uint32_t r_high = color_nibbles[r >> 4];
+	uint32_t r_low  = color_nibbles[r & 0xf];
+	uint32_t g_high = color_nibbles[g >> 4];
+	uint32_t g_low  = color_nibbles[g & 0xf];
+	uint32_t b_high = color_nibbles[b >> 4];
+	uint32_t b_low  = color_nibbles[b & 0xf];
 
-  // RGB 5050 order: G, R, B; MSB first.
-  int offset = 0;
-  for (int i = 0; i < 24; i++) {
-    switch (i % 4) {
-    case 0:
-      // current[5:0] | next[5:4]
-      buf[offset] |= ((rgb_data & (1<<(23-i))) ? 0b11100000 : 0b10000000)
-                  |  ((rgb_data & (1<<(22-i))) ?       0b11 :       0b10);
-      break;
-    case 1:
-      // current[3:0] | next[5:2]
-      buf[offset] |= ((rgb_data & (1<<(23-i))) ? 0b10000000 :          0)
-                  |  ((rgb_data & (1<<(22-i))) ?     0b1110 :     0b1000);
-      break;
-    case 2:
-      // current[1:0] | next[5:0]
-      buf[offset] |= ((rgb_data & (1<<(22-i))) ? 0b00111000 : 0b00100000);
-      // Lookahead read next bit, so advance i.
-      i += 1;
-      break;
-    }
+	buf[0]  = (g_high >> 16) & 0xff;
+	buf[1]  = (g_high >>  8) & 0xff;
+	buf[2]  = (g_high)       & 0xff;
+	buf[3]  = (g_low  >> 16) & 0xff;
+	buf[4]  = (g_low  >>  8) & 0xff;
+	buf[5]  = (g_low)        & 0xff;
 
-    offset += 1;
-  }
+	buf[6]  = (r_high >> 16) & 0xff;
+	buf[7]  = (r_high >>  8) & 0xff;
+	buf[8]  = (r_high)       & 0xff;
+	buf[9]  = (r_low  >> 16) & 0xff;
+	buf[10] = (r_low  >>  8) & 0xff;
+	buf[11] = (r_low)        & 0xff;
+
+	buf[12] = (b_high >> 16) & 0xff;
+	buf[13] = (b_high >>  8) & 0xff;
+	buf[14] = (b_high)       & 0xff;
+	buf[15] = (b_low  >> 16) & 0xff;
+	buf[16] = (b_low  >>  8) & 0xff;
+	buf[17] = (b_low)        & 0xff;
 }
 ```
 
+
 So you could set a region of a buffer like this:
 ```
-RGB5050_color_write(0xAB, 0xCD, 0xEF, (uint8_t*) (some_buffer + 18 * offset));
+RGB5050_pixel_write(0xAB, 0xCD, 0xEF, (uint8_t*) (some_buffer + 18 * offset));
 ```
 
 And then transmit that buffer over SPI:
